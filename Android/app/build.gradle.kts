@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.android"
-        minSdk = 24
+        minSdk = 30
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
@@ -37,10 +37,13 @@ android {
     buildFeatures {
         compose = true
     }
+
+    aaptOptions {
+        noCompress("tflite", "lite")
+    }
 }
 
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -56,6 +59,22 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
+
+    // 기본 TensorFlow Lite
     implementation(libs.tensorflow.lite)
+
+    // TensorFlow Lite 확장 연산자
     implementation(libs.tensorflow.lite.select.tf.ops)
+
+    // GPU 가속 지원
+    implementation(libs.tensorflow.lite.gpu)
+
+    // 1) core TFLite 런타임 (NNAPI 포함)
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+
+    // 2) GPU Delegate 런타임
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
+
+    // 3) **GPU Delegate API** (Options 클래스 등)
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
 }

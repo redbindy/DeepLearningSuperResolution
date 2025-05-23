@@ -1,17 +1,13 @@
 package com.example.android
 
-import android.content.ContentValues
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Rect
 import android.media.MediaMetadataRetriever
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
-import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -19,37 +15,31 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as UIColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import com.example.android.ui.theme.AndroidTheme
 import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.flex.FlexDelegate
-import java.io.FileInputStream
-import java.lang.ref.WeakReference
+import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.channels.FileChannel
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
-import kotlin.coroutines.suspendCoroutine
+import kotlin.math.ceil
+import kotlin.math.min
+import androidx.core.graphics.createBitmap
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         setContent {
             AndroidTheme {
                 Surface(
@@ -70,26 +60,23 @@ fun VideoFrameUpscale() {
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
 
-    // TFLite 모델 인터프리터 및 프레임 처리 컨트롤러
+    var upscaleEnabled by remember { mutableStateOf(true) }
+
     val frameProcessor = remember { FrameProcessor() }
-    val processingJob = remember { mutableStateOf<Job?>(null) }
 
-    // 모델 로딩 처리
     LaunchedEffect(Unit) {
+        isLoading = true
         try {
-            isLoading = true
             frameProcessor.loadModel(context)
-            isLoading = false
         } catch (e: Exception) {
             Log.e("VideoUpscale", "모델 로딩 실패", e)
-            errorMessage = "모델 로딩 실패: ${e.localizedMessage}"
+            errorMessage = "모델 로딩 실패"
+        } finally {
             isLoading = false
         }
     }
 
-    // 비디오 선택기
     val getVideoUri = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         selectedUri = uri
         errorMessage = null
@@ -98,10 +85,8 @@ fun VideoFrameUpscale() {
         }
     }
 
-    // 앱 종료시 리소스 정리
     DisposableEffect(Unit) {
         onDispose {
-            processingJob.value?.cancel()
             frameProcessor.release()
         }
     }
@@ -120,14 +105,9 @@ fun VideoFrameUpscale() {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(60.dp)
-                    )
+                    CircularProgressIndicator()
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "모델 로딩 중...",
-                        fontSize = 18.sp
-                    )
+                    Text("모델 로딩 중...")
                 }
             }
             errorMessage != null -> {
@@ -138,10 +118,10 @@ fun VideoFrameUpscale() {
                 )
             }
             selectedUri != null && isPlaying -> {
-                // 실시간 비디오 처리 및 표시
                 RealTimeVideoProcessing(
                     uri = selectedUri!!,
                     frameProcessor = frameProcessor,
+                    upscaleEnabled = upscaleEnabled,
                     onStop = {
                         isPlaying = false
                         selectedUri = null
@@ -153,23 +133,28 @@ fun VideoFrameUpscale() {
                 )
             }
             else -> {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text(
-                        text = "화면을 눌러서 비디오 선택",
-                        fontSize = 20.sp,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "선택된 영상의 모든 프레임이 실시간으로 업스케일되어 표시됩니다",
-                        textAlign = TextAlign.Center,
-                        fontSize = 16.sp
-                    )
-                }
+                Text(
+                    text = "화면을 눌러서 비디오 선택",
+                    fontSize = 20.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        // 화면 하단 업스케일 ON/OFF 토글
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 36.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("업스케일")
+                Switch(
+                    checked = upscaleEnabled,
+                    onCheckedChange = { upscaleEnabled = it }
+                )
+                Text(if (upscaleEnabled) "ON" else "OFF")
             }
         }
     }
@@ -179,129 +164,106 @@ fun VideoFrameUpscale() {
 fun RealTimeVideoProcessing(
     uri: Uri,
     frameProcessor: FrameProcessor,
+    upscaleEnabled: Boolean,
     onStop: () -> Unit,
     onError: (String) -> Unit
 ) {
     val context = LocalContext.current
-    val processingActive = remember { AtomicBoolean(true) }
     val scope = rememberCoroutineScope()
-
-    // 현재 프레임 상태
+    val isActive = remember { mutableStateOf(true) }
     val currentFrameState = remember { mutableStateOf<Bitmap?>(null) }
-    val isFrameProcessing = remember { mutableStateOf(false) }
+    val frameKey = remember { mutableIntStateOf(0) }
 
-    // 비트맵 참조 관리를 위한 키
-    val frameKey = remember { mutableStateOf(0) }
+    // 비디오 재생 제어 상태
+    var isPlayingState by remember { mutableStateOf(true) }
+    var currentPosition by remember { mutableStateOf(0L) }
+    var totalDuration by remember { mutableStateOf(0L) }
+    var seekPosition by remember { mutableStateOf<Long?>(null) }
 
-    // 비디오 처리 컴포넌트
+    val upscaleEnabledState = rememberUpdatedState(upscaleEnabled)
+
     Box(modifier = Modifier.fillMaxSize()) {
         DisposableEffect(uri) {
             val job = scope.launch {
                 try {
-                    // 비디오 메타데이터 가져오기
                     val retriever = MediaMetadataRetriever()
                     retriever.setDataSource(context, uri)
 
                     val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0
+                    totalDuration = duration
                     val fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull() ?: 30f
                     val frameInterval = (1000 / fps).toLong()
 
-                    Log.d("VideoUpscale", "비디오 길이: ${duration}ms, FPS: $fps, 프레임 간격: ${frameInterval}ms")
-
-                    // 비디오 처리 시작
                     var timeInMicros = 0L
-                    while (isActive && processingActive.get() && timeInMicros <= duration * 1000) {
-                        val frameTime = timeInMicros // 현재 타임스탬프에서 프레임 가져오기
 
-                        // 이전 프레임 처리가 끝날 때까지 대기
-                        if (isFrameProcessing.value) {
-                            delay(5) // 작은 지연으로 CPU 점유율 감소
-                            continue
+                    while (isActive.value && timeInMicros <= duration * 1000) {
+                        // Seek 요청이 있는 경우 처리
+                        seekPosition?.let { seekPos ->
+                            timeInMicros = seekPos * 1000
+                            seekPosition = null
                         }
 
-                        isFrameProcessing.value = true
+                        // 일시정지 상태인 경우 대기
+                        while (!isPlayingState && isActive.value) {
+                            delay(100)
+                        }
 
-                        try {
-                            // 다음 키 준비
-                            val nextKey = frameKey.value + 1
+                        if (!isActive.value) break
 
-                            withContext(Dispatchers.IO) {
-                                // 프레임 가져오기
-                                val originalFrame = retriever.getFrameAtTime(frameTime, MediaMetadataRetriever.OPTION_CLOSEST)
-
-                                if (originalFrame != null) {
-                                    try {
-                                        // 프레임 처리 (복사본 생성 및 원본 해제)
-                                        val processedFrame = frameProcessor.processFrame(originalFrame)
-
-                                        // UI 스레드에서 상태 업데이트
-                                        withContext(Dispatchers.Main) {
-                                            // 이전 프레임 해제
-                                            currentFrameState.value?.recycle()
-
-                                            // 새 프레임 설정 및 키 업데이트
-                                            currentFrameState.value = processedFrame
-                                            frameKey.value = nextKey
-                                        }
-                                    } finally {
-                                        // 원본 비트맵 항상 해제
-                                        originalFrame.recycle()
-                                    }
+                        withContext(Dispatchers.IO) {
+                            val originalFrame = retriever.getFrameAtTime(timeInMicros, MediaMetadataRetriever.OPTION_CLOSEST)
+                            if (originalFrame != null) {
+                                val processedFrame = if (upscaleEnabledState.value) {
+                                    frameProcessor.processFrame(originalFrame)
                                 } else {
-                                    Log.w("VideoUpscale", "프레임을 가져올 수 없음: $timeInMicros")
+                                    frameProcessor.bilinearScale(
+                                        originalFrame,
+                                        originalFrame.width * 3,
+                                        originalFrame.height * 3
+                                    )
+                                }
+                                originalFrame.recycle()
+                                withContext(Dispatchers.Main) {
+                                    currentFrameState.value?.recycle()
+                                    currentFrameState.value = processedFrame
+                                    frameKey.intValue += 1
+                                    currentPosition = timeInMicros / 1000
                                 }
                             }
-
-                            // 다음 프레임까지 딜레이
-                            delay(frameInterval)
-
-                        } catch (e: Exception) {
-                            Log.e("VideoUpscale", "프레임 처리 중 오류", e)
-                        } finally {
-                            isFrameProcessing.value = false
                         }
 
-                        // 다음 프레임 타임스탬프로 이동
+                        delay(frameInterval)
                         timeInMicros += frameInterval * 1000
                     }
 
-                    // 재생 완료
                     retriever.release()
-
                     withContext(Dispatchers.Main) {
-                        // 마지막 프레임 해제
                         currentFrameState.value?.recycle()
                         currentFrameState.value = null
                         onStop()
                     }
-
                 } catch (e: Exception) {
-                    Log.e("VideoUpscale", "비디오 처리 중 오류 발생", e)
-
+                    Log.e("VideoUpscale", "비디오 처리 오류", e)
                     withContext(Dispatchers.Main) {
                         currentFrameState.value?.recycle()
                         currentFrameState.value = null
-                        onError("비디오 처리 오류: ${e.localizedMessage}")
+                        onError("비디오 처리 오류")
                     }
                 }
             }
-
             onDispose {
-                processingActive.set(false)
+                isActive.value = false
                 job.cancel()
-
-                // 최종 리소스 정리
                 currentFrameState.value?.recycle()
                 currentFrameState.value = null
             }
         }
 
-        // 현재 프레임 표시 (키 변경시 재구성)
         val currentFrame = currentFrameState.value
-        val key = frameKey.value
+        val key = frameKey.intValue
 
         if (currentFrame != null && !currentFrame.isRecycled) {
-            key(key) {  // 키를 사용하여 이미지 재구성
+            key(key) {
                 Image(
                     bitmap = currentFrame.asImageBitmap(),
                     contentDescription = "업스케일된 프레임",
@@ -311,227 +273,344 @@ fun RealTimeVideoProcessing(
             }
         }
 
-        // 안내 텍스트
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            contentAlignment = Alignment.BottomCenter
+        // 비디오 컨트롤 UI
+        VideoControls(
+            isPlaying = isPlayingState,
+            currentPosition = currentPosition,
+            totalDuration = totalDuration,
+            onPlayPause = { isPlayingState = !isPlayingState },
+            onSeek = { position -> seekPosition = position },
+            onStop = onStop,
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
+    }
+}
+
+@Composable
+fun VideoControls(
+    isPlaying: Boolean,
+    currentPosition: Long,
+    totalDuration: Long,
+    onPlayPause: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+    ) {
+        // 슬라이더 위치 상태
+        var sliderPosition by remember { mutableStateOf(
+            if (totalDuration > 0) (currentPosition.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f)
+            else 0f
+        ) }
+
+        // 프로그레스 바
+        if (totalDuration > 0) {
+            // 현재 위치 변할 때마다 sliderPosition도 연동
+            LaunchedEffect(currentPosition, totalDuration) {
+                sliderPosition = if (totalDuration > 0)
+                    (currentPosition.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f)
+                else 0f
+            }
+
+            Column {
+                // 시간 표시
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = formatTime(currentPosition),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = formatTime(totalDuration),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                // 프로그레스 바 (트랙 클릭, 드래그 모두 Seek)
+                Slider(
+                    value = sliderPosition,
+                    onValueChange = { newProgress ->
+                        sliderPosition = newProgress
+                    },
+                    onValueChangeFinished = {
+                        val newPosition = (sliderPosition * totalDuration).toLong()
+                        onSeek(newPosition)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 컨트롤 버튼들
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f),
+            shape = MaterialTheme.shapes.medium
         ) {
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
-                shape = MaterialTheme.shapes.medium
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                // 재생/일시정지 버튼
+                Button(
+                    onClick = onPlayPause,
+                    modifier = Modifier.width(60.dp).height(48.dp)
+                ) {
+                    Text(
+                        text = if (isPlaying) "⏸" else "▶",
+                        fontSize = 12.sp
+                    )
+                }
+
+                // 정지 버튼
+                Button(
+                    onClick = onStop,
+                    modifier = Modifier.width(60.dp).height(48.dp)
+                ) {
+                    Text(
+                        text = "⏹",
+                        fontSize = 12.sp
+                    )
+                }
+
                 Text(
-                    text = "영상 처리 중... 터치하여 정지",
-                    modifier = Modifier
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                        .clickable {
-                            processingActive.set(false)
-                            onStop()
-                        },
-                    fontSize = 16.sp
+                    text = if (isPlaying) "재생 중" else "일시정지",
+                    style = MaterialTheme.typography.bodyMedium
                 )
             }
         }
     }
 }
 
-/**
- * 프레임 처리 클래스 - 비디오 프레임 업스케일링 처리
- */
+fun formatTime(timeMs: Long): String {
+    val totalSeconds = timeMs / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
+}
+
 class FrameProcessor {
     private var interpreter: Interpreter? = null
-    private val lock = ReentrantLock()
+    private var nnApiDelegate: NnApiDelegate? = null
     private var isModelLoaded = false
 
-    suspend fun loadModel(context: android.content.Context) {
+    private val PATCH_SIZE = 128
+
+    fun loadModel(context: android.content.Context) {
         if (isModelLoaded) return
 
-        withContext(Dispatchers.IO) {
-            lock.withLock {
-                try {
-                    val fileDescriptor = context.assets.openFd("ESPCN.tflite")
-                    val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-                    val fileChannel = inputStream.channel
-                    val startOffset = fileDescriptor.startOffset
-                    val declaredLength = fileDescriptor.declaredLength
-                    val model = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-
-                    // TFLite 인터프리터 옵션 설정
-                    val options = Interpreter.Options().apply {
-                        setNumThreads(4)  // 병렬 처리 활성화
-                        addDelegate(FlexDelegate())  // 추가 연산자 지원
-                    }
-
-                    interpreter = Interpreter(model, options)
-                    isModelLoaded = true
-
-                    Log.d("FrameProcessor", "모델 로딩 완료")
-                } catch (e: Exception) {
-                    Log.e("FrameProcessor", "모델 로딩 실패", e)
-                    throw e
+        try {
+            val nnApiOptions = NnApiDelegate.Options().apply {
+                allowFp16 = true
+                useNnapiCpu = true
+                executionPreference = NnApiDelegate.Options.EXECUTION_PREFERENCE_SUSTAINED_SPEED
+            }
+            nnApiDelegate = NnApiDelegate(nnApiOptions)
+            val options = Interpreter.Options().apply {
+                numThreads = 4
+                addDelegate(nnApiDelegate)
+            }
+            val modelBytes = context.assets.open("XLSR_W8A8.tflite").readBytes()
+            val modelBuffer = ByteBuffer.allocateDirect(modelBytes.size).apply {
+                order(ByteOrder.nativeOrder())
+                put(modelBytes)
+                rewind()
+            }
+            interpreter = Interpreter(modelBuffer, options)
+            isModelLoaded = true
+            Log.d("FrameProcessor", "NPU 모델 로딩 성공")
+        } catch (e: Exception) {
+            Log.w("FrameProcessor", "NPU 모드 로딩 실패, CPU 모드로 시도", e)
+            try {
+                nnApiDelegate?.close()
+                nnApiDelegate = null
+                interpreter?.close()
+                val options = Interpreter.Options().apply { numThreads = 4 }
+                val modelBytes = context.assets.open("XLSR_W8A8.tflite").readBytes()
+                val modelBuffer = ByteBuffer.allocateDirect(modelBytes.size).apply {
+                    order(ByteOrder.nativeOrder())
+                    put(modelBytes)
+                    rewind()
                 }
+                interpreter = Interpreter(modelBuffer, options)
+                isModelLoaded = true
+                Log.d("FrameProcessor", "CPU 모델 로딩 성공")
+            } catch (e2: Exception) {
+                Log.e("FrameProcessor", "모델 로딩 최종 실패", e2)
+                throw e2
             }
         }
     }
 
     fun processFrame(frame: Bitmap): Bitmap {
         if (!isModelLoaded || interpreter == null) {
-            Log.w("FrameProcessor", "모델이 로드되지 않았습니다")
-            return Bitmap.createBitmap(frame) // 원본 비트맵의 복사본 반환
+            return bilinearScale(frame, frame.width * 3, frame.height * 3)
+        }
+        val patchRowCount = ceil(frame.height / PATCH_SIZE.toFloat()).toInt()
+        val patchColCount = ceil(frame.width / PATCH_SIZE.toFloat()).toInt()
+
+        var patchOutputWidth = 0
+        var patchOutputHeight = 0
+
+        run {
+            val tempPatch = Bitmap.createBitmap(
+                frame, 0, 0,
+                min(PATCH_SIZE, frame.width),
+                min(PATCH_SIZE, frame.height)
+            )
+            val interpreter = this.interpreter!!
+            val inputBuffer = prepareModelInputNHWC(tempPatch)
+            val outputTensor = interpreter.getOutputTensor(0)
+            val outShape = outputTensor.shape()
+            patchOutputHeight = outShape[1]
+            patchOutputWidth = outShape[2]
+            tempPatch.recycle()
         }
 
-        return lock.withLock {
-            try {
-                // 너무 큰 이미지는 효율성을 위해 스케일 다운
-                // 크기 제한은 없지만 효율성을 위해 내부적으로 조정
-                val scaleFactor = calculateOptimalScaleFactor(frame.width, frame.height)
+        val outputWidth = (frame.width * patchOutputWidth) / PATCH_SIZE
+        val outputHeight = (frame.height * patchOutputHeight) / PATCH_SIZE
 
-                val scaledBitmap = if (scaleFactor < 1.0f) {
-                    Bitmap.createScaledBitmap(
-                        frame,
-                        (frame.width * scaleFactor).toInt(),
-                        (frame.height * scaleFactor).toInt(),
-                        true
-                    )
+        val resultBitmap = createBitmap(outputWidth, outputHeight)
+        val canvas = Canvas(resultBitmap)
+        canvas.drawColor(Color.BLACK)
+
+        for (row in 0 until patchRowCount) {
+            for (col in 0 until patchColCount) {
+                val startX = col * PATCH_SIZE
+                val startY = row * PATCH_SIZE
+                val endX = min(startX + PATCH_SIZE, frame.width)
+                val endY = min(startY + PATCH_SIZE, frame.height)
+                val patchWidth = endX - startX
+                val patchHeight = endY - startY
+
+                val patch = if (patchWidth == PATCH_SIZE && patchHeight == PATCH_SIZE) {
+                    Bitmap.createBitmap(frame, startX, startY, PATCH_SIZE, PATCH_SIZE)
                 } else {
-                    // 복사본 생성 (원본에 영향 없도록)
-                    Bitmap.createBitmap(frame)
+                    val paddedPatch = createBitmap(PATCH_SIZE, PATCH_SIZE)
+                    val tempCanvas = Canvas(paddedPatch)
+                    tempCanvas.drawColor(Color.BLACK)
+                    tempCanvas.drawBitmap(
+                        frame,
+                        Rect(startX, startY, endX, endY),
+                        Rect(0, 0, patchWidth, patchHeight),
+                        null
+                    )
+                    paddedPatch
+                }
+                val upscaledPatch = processPatchDynamic(patch)
+                patch.recycle()
+
+                val drawWidth = (patchWidth * patchOutputWidth) / PATCH_SIZE
+                val drawHeight = (patchHeight * patchOutputHeight) / PATCH_SIZE
+
+                val croppedUpscaled = if (drawWidth != upscaledPatch.width || drawHeight != upscaledPatch.height) {
+                    Bitmap.createBitmap(upscaledPatch, 0, 0, drawWidth, drawHeight)
+                } else {
+                    upscaledPatch
                 }
 
-                // YCbCr 변환 및 입력 준비
-                val (input, cr, cb) = extractYInputFromBitmap(scaledBitmap)
-
-                // 출력 크기 계산 (3배 업스케일)
-                val outputWidth = scaledBitmap.width * 3
-                val outputHeight = scaledBitmap.height * 3
-
-                // 출력 버퍼 준비
-                val output = ByteBuffer.allocateDirect(outputWidth * outputHeight * 4)
-                    .order(ByteOrder.nativeOrder())
-
-                // 모델 입력 크기 조정
-                val inputShape = intArrayOf(1, 1, scaledBitmap.height, scaledBitmap.width)
-                interpreter?.resizeInput(0, inputShape)
-                interpreter?.allocateTensors()
-
-                // 모델 실행
-                interpreter?.run(input, output)
-
-                try {
-                    // 결과 이미지 복원
-                    val result = restoreBitmapFromY(output, cr, cb, outputHeight, outputWidth)
-                    return result
-                } finally {
-                    // 중간 비트맵 해제 (원본과 다를 경우)
-                    if (scaledBitmap !== frame) {
-                        scaledBitmap.recycle()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("FrameProcessor", "프레임 처리 실패", e)
-                // 오류 시 원본의 복사본 반환
-                return Bitmap.createBitmap(frame)
+                canvas.drawBitmap(
+                    croppedUpscaled,
+                    null,
+                    Rect(
+                        col * patchOutputWidth,
+                        row * patchOutputHeight,
+                        col * patchOutputWidth + drawWidth,
+                        row * patchOutputHeight + drawHeight
+                    ),
+                    null
+                )
+                if (croppedUpscaled != upscaledPatch) croppedUpscaled.recycle()
+                upscaledPatch.recycle()
             }
+        }
+        return resultBitmap
+    }
+
+    private fun processPatchDynamic(patch: Bitmap): Bitmap {
+        val interpreter = this.interpreter ?: return bilinearScale(patch, patch.width * 3, patch.height * 3)
+        val inputBuffer = prepareModelInputNHWC(patch)
+        val outputTensor = interpreter.getOutputTensor(0)
+        val outShape = outputTensor.shape()
+        val outHeight = outShape[1]
+        val outWidth = outShape[2]
+        val outChannels = outShape[3]
+        val outputBuffer = ByteBuffer.allocateDirect(outHeight * outWidth * outChannels)
+            .order(ByteOrder.nativeOrder())
+
+        try {
+            interpreter.run(inputBuffer, outputBuffer)
+            return reconstructImageNHWC(outputBuffer, outWidth, outHeight)
+        } catch (e: Exception) {
+            Log.e("FrameProcessor", "모델 실행 오류: ${e.message}")
+            e.printStackTrace()
+            return bilinearScale(patch, patch.width * 3, patch.height * 3)
         }
     }
 
-    // 최적의 스케일 팩터 계산 (메모리/성능 최적화)
-    private fun calculateOptimalScaleFactor(width: Int, height: Int): Float {
-        val maxPixels = 1280 * 720 // HD 해상도 기준
-        val imgPixels = width * height
-
-        return if (imgPixels > maxPixels) {
-            val factor = Math.sqrt(maxPixels.toDouble() / imgPixels)
-            factor.toFloat()
-        } else {
-            1.0f // 축소 없음
+    private fun prepareModelInputNHWC(bitmap: Bitmap): ByteBuffer {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        val inputBuffer = ByteBuffer.allocateDirect(1 * height * width * 3).order(ByteOrder.nativeOrder())
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val pixel = pixels[y * width + x]
+                inputBuffer.put(((pixel shr 16) and 0xFF).toByte())
+                inputBuffer.put(((pixel shr 8) and 0xFF).toByte())
+                inputBuffer.put((pixel and 0xFF).toByte())
+            }
         }
+        inputBuffer.rewind()
+        return inputBuffer
+    }
+
+    private fun reconstructImageNHWC(
+        outputBuffer: ByteBuffer,
+        width: Int,
+        height: Int
+    ): Bitmap {
+        outputBuffer.rewind()
+        val output = createBitmap(width, height)
+        val pixels = IntArray(width * height)
+        for (i in 0 until width * height) {
+            val r = outputBuffer.get().toInt() and 0xFF
+            val g = outputBuffer.get().toInt() and 0xFF
+            val b = outputBuffer.get().toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        output.setPixels(pixels, 0, width, 0, 0, width, height)
+        return output
+    }
+
+    fun bilinearScale(src: Bitmap, destWidth: Int, destHeight: Int): Bitmap {
+        val result = createBitmap(destWidth, destHeight)
+        val canvas = Canvas(result)
+        canvas.drawBitmap(
+            src,
+            Rect(0, 0, src.width, src.height),
+            Rect(0, 0, destWidth, destHeight),
+            null
+        )
+        return result
     }
 
     fun release() {
-        lock.withLock {
-            interpreter?.close()
-            interpreter = null
-            isModelLoaded = false
-        }
+        interpreter?.close()
+        interpreter = null
+        nnApiDelegate?.close()
+        nnApiDelegate = null
+        isModelLoaded = false
     }
-}
-
-fun extractYInputFromBitmap(bitmap: Bitmap): Triple<ByteBuffer, ByteArray, ByteArray> {
-    val width = bitmap.width
-    val height = bitmap.height
-    val inputSize = 1 * 1 * height * width  // NCHW 형식
-    val inputBuffer = ByteBuffer.allocateDirect(inputSize * 4).order(ByteOrder.nativeOrder())
-    val cb = ByteArray(width * height)
-    val cr = ByteArray(width * height)
-
-    val pixels = IntArray(width * height)
-    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
-    for (i in pixels.indices) {
-        val color = pixels[i]
-        val r = (color shr 16) and 0xFF
-        val g = (color shr 8) and 0xFF
-        val b = color and 0xFF
-
-        // YCbCr 표준 변환 공식 사용
-        val y = (0.299 * r + 0.587 * g + 0.114 * b).toInt().coerceIn(0, 255)
-        val cbVal = (128 + (-0.169 * r - 0.331 * g + 0.5 * b)).toInt().coerceIn(0, 255)
-        val crVal = (128 + (0.5 * r - 0.419 * g - 0.081 * b)).toInt().coerceIn(0, 255)
-
-        // 입력 정규화 (0~1)
-        inputBuffer.putFloat(y / 255.0f)
-        cb[i] = cbVal.toByte()
-        cr[i] = crVal.toByte()
-    }
-    inputBuffer.rewind()
-    return Triple(inputBuffer, cr, cb)
-}
-
-fun restoreBitmapFromY(
-    yBuffer: ByteBuffer,
-    cr: ByteArray,
-    cb: ByteArray,
-    height: Int,
-    width: Int
-): Bitmap {
-    yBuffer.rewind()
-    val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-
-    // 원본 이미지 크기
-    val originalHeight = height / 3
-    val originalWidth = width / 3
-
-    for (y in 0 until height) {
-        for (x in 0 until width) {
-            val index = y * width + x
-
-            if (index >= width * height) continue
-
-            // 업스케일된 Y 값 가져오기 (0-1 범위에서 0-255로 변환)
-            val yValue = (yBuffer.getFloat(index * 4) * 255).toInt().coerceIn(0, 255)
-
-            // 원본 이미지의 좌표 계산 (다운샘플링)
-            val originalY = (y * originalHeight / height).coerceIn(0, originalHeight - 1)
-            val originalX = (x * originalWidth / width).coerceIn(0, originalWidth - 1)
-            val originalIndex = originalY * originalWidth + originalX
-
-            // 원본 이미지 사이즈 범위 확인
-            if (originalIndex >= cb.size || originalIndex >= cr.size) continue
-
-            // 바이트 값을 부호 없는 정수로 변환 (0-255)
-            val crVal = cr[originalIndex].toInt() and 0xFF
-            val cbVal = cb[originalIndex].toInt() and 0xFF
-
-            // YCbCr을 RGB로 변환 (표준 BT.601 공식 사용)
-            val r = (yValue + 1.402 * (crVal - 128)).toInt().coerceIn(0, 255)
-            val g = (yValue - 0.344 * (cbVal - 128) - 0.714 * (crVal - 128)).toInt().coerceIn(0, 255)
-            val b = (yValue + 1.772 * (cbVal - 128)).toInt().coerceIn(0, 255)
-
-            output.setPixel(x, y, Color.rgb(r, g, b))
-        }
-    }
-    return output
 }
