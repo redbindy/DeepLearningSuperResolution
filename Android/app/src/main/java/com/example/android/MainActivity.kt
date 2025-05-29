@@ -1,5 +1,6 @@
 package com.example.android
 
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -15,18 +16,18 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color as UIColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.animation.*
+import androidx.compose.ui.draw.scale
 import com.example.android.ui.theme.AndroidTheme
 import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
@@ -36,10 +37,15 @@ import java.nio.ByteOrder
 import kotlin.math.ceil
 import kotlin.math.min
 import androidx.core.graphics.createBitmap
+import androidx.compose.animation.core.tween
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 가로 모드로 고정
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+
         setContent {
             AndroidTheme {
                 Surface(
@@ -122,6 +128,7 @@ fun VideoFrameUpscale() {
                     uri = selectedUri!!,
                     frameProcessor = frameProcessor,
                     upscaleEnabled = upscaleEnabled,
+                    onUpscaleToggle = { upscaleEnabled = it },
                     onStop = {
                         isPlaying = false
                         selectedUri = null
@@ -141,20 +148,22 @@ fun VideoFrameUpscale() {
             }
         }
 
-        // 화면 하단 업스케일 ON/OFF 토글
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 36.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("업스케일")
-                Switch(
-                    checked = upscaleEnabled,
-                    onCheckedChange = { upscaleEnabled = it }
-                )
-                Text(if (upscaleEnabled) "ON" else "OFF")
+        // 화면 하단 업스케일 ON/OFF 토글 (비디오 재생 중이 아닐 때만 표시)
+        if (!isPlaying) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 36.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("업스케일")
+                    Switch(
+                        checked = upscaleEnabled,
+                        onCheckedChange = { upscaleEnabled = it }
+                    )
+                    Text(if (upscaleEnabled) "ON" else "OFF")
+                }
             }
         }
     }
@@ -165,6 +174,7 @@ fun RealTimeVideoProcessing(
     uri: Uri,
     frameProcessor: FrameProcessor,
     upscaleEnabled: Boolean,
+    onUpscaleToggle: (Boolean) -> Unit,
     onStop: () -> Unit,
     onError: (String) -> Unit
 ) {
@@ -180,7 +190,52 @@ fun RealTimeVideoProcessing(
     var totalDuration by remember { mutableStateOf(0L) }
     var seekPosition by remember { mutableStateOf<Long?>(null) }
 
+    // UI 표시/숨김 상태
+    var showControls by remember { mutableStateOf(true) }
+    var hideControlsJob: Job? by remember { mutableStateOf(null) }
+
     val upscaleEnabledState = rememberUpdatedState(upscaleEnabled)
+
+    // UI 자동 숨김 함수
+    fun scheduleHideControls() {
+        hideControlsJob?.cancel()
+        hideControlsJob = scope.launch {
+            delay(3000) // 3초 후 숨김
+            showControls = false
+        }
+    }
+
+    // UI 표시 함수
+    fun showControlsAndScheduleHide() {
+        hideControlsJob?.cancel()
+        showControls = true
+        if (isPlayingState) {
+            scheduleHideControls()
+        }
+    }
+
+    // UI 토글 함수 (터치로 켜고 끄기)
+    fun toggleControls() {
+        hideControlsJob?.cancel()
+        showControls = !showControls
+        if (showControls && isPlayingState) {
+            scheduleHideControls()
+        }
+    }
+
+    // 재생 상태가 변경될 때 UI 숨김 스케줄링
+    LaunchedEffect(isPlayingState) {
+        if (isPlayingState && showControls) {
+            scheduleHideControls()
+        } else if (!isPlayingState) {
+            hideControlsJob?.cancel()
+        }
+    }
+
+    // 컴포넌트 시작 시 UI 숨김 스케줄링
+    LaunchedEffect(Unit) {
+        scheduleHideControls()
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         DisposableEffect(uri) {
@@ -254,6 +309,7 @@ fun RealTimeVideoProcessing(
             onDispose {
                 isActive.value = false
                 job.cancel()
+                hideControlsJob?.cancel()
                 currentFrameState.value?.recycle()
                 currentFrameState.value = null
             }
@@ -262,27 +318,59 @@ fun RealTimeVideoProcessing(
         val currentFrame = currentFrameState.value
         val key = frameKey.intValue
 
+        // 비디오 프레임 (전체 화면에 클릭 가능)
         if (currentFrame != null && !currentFrame.isRecycled) {
             key(key) {
                 Image(
                     bitmap = currentFrame.asImageBitmap(),
                     contentDescription = "업스케일된 프레임",
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clickable(
+                            interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            toggleControls() // 터치로 UI 토글
+                        },
                     contentScale = ContentScale.Fit
                 )
             }
         }
 
-        // 비디오 컨트롤 UI
-        VideoControls(
-            isPlaying = isPlayingState,
-            currentPosition = currentPosition,
-            totalDuration = totalDuration,
-            onPlayPause = { isPlayingState = !isPlayingState },
-            onSeek = { position -> seekPosition = position },
-            onStop = onStop,
+        // 비디오 컨트롤 UI (애니메이션과 함께 표시/숨김)
+        AnimatedVisibility(
+            visible = showControls,
+            enter = slideInVertically(
+                initialOffsetY = { it },
+                animationSpec = tween(300)
+            ) + fadeIn(animationSpec = tween(300)),
+            exit = slideOutVertically(
+                targetOffsetY = { it },
+                animationSpec = tween(300)
+            ) + fadeOut(animationSpec = tween(300)),
             modifier = Modifier.align(Alignment.BottomCenter)
-        )
+        ) {
+            VideoControls(
+                isPlaying = isPlayingState,
+                currentPosition = currentPosition,
+                totalDuration = totalDuration,
+                onPlayPause = {
+                    isPlayingState = !isPlayingState
+                    showControlsAndScheduleHide()
+                },
+                onSeek = { position ->
+                    seekPosition = position
+                    showControlsAndScheduleHide()
+                },
+                onStop = onStop,
+                upscaleEnabled = upscaleEnabled,
+                onUpscaleToggle = { enabled ->
+                    onUpscaleToggle(enabled)
+                    showControlsAndScheduleHide()
+                },
+                modifier = Modifier
+            )
+        }
     }
 }
 
@@ -294,6 +382,8 @@ fun VideoControls(
     onPlayPause: () -> Unit,
     onSeek: (Long) -> Unit,
     onStop: () -> Unit,
+    upscaleEnabled: Boolean,
+    onUpscaleToggle: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -353,7 +443,7 @@ fun VideoControls(
 
         // 컨트롤 버튼들
         Surface(
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.9f),
             shape = MaterialTheme.shapes.medium
         ) {
             Row(
@@ -383,10 +473,34 @@ fun VideoControls(
                     )
                 }
 
-                Text(
-                    text = if (isPlaying) "재생 중" else "일시정지",
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                Column {
+                    Text(
+                        text = if (isPlaying) "재생 중" else "일시정지",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    // 업스케일 토글
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "업스케일",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                        )
+                        Switch(
+                            checked = upscaleEnabled,
+                            onCheckedChange = onUpscaleToggle,
+                            modifier = Modifier.scale(0.8f)
+                        )
+                        Text(
+                            text = if (upscaleEnabled) "ON" else "OFF",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                        )
+                    }
+                }
             }
         }
     }
@@ -417,7 +531,7 @@ class FrameProcessor {
             }
             nnApiDelegate = NnApiDelegate(nnApiOptions)
             val options = Interpreter.Options().apply {
-                numThreads = 4
+                numThreads = 8
                 addDelegate(nnApiDelegate)
             }
             val modelBytes = context.assets.open("XLSR_W8A8.tflite").readBytes()
@@ -469,7 +583,6 @@ class FrameProcessor {
                 min(PATCH_SIZE, frame.height)
             )
             val interpreter = this.interpreter!!
-            val inputBuffer = prepareModelInputNHWC(tempPatch)
             val outputTensor = interpreter.getOutputTensor(0)
             val outShape = outputTensor.shape()
             patchOutputHeight = outShape[1]

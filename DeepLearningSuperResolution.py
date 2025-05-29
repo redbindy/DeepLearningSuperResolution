@@ -32,6 +32,8 @@ class VideoWindow(QWidget):
         super().__init__()
         self.setWindowTitle("ESPCN 360p YouTube 추론")
         self.resize(960, 640)
+        # 최소 크기 설정 추가
+        self.setMinimumSize(640, 480)
 
         # Layouts
         self.mainLayout = QVBoxLayout()
@@ -54,10 +56,15 @@ class VideoWindow(QWidget):
         self.onOffBox = QCheckBox("초해상도", self)
         self.topLayout.addWidget(self.onOffBox)
 
-        # 영상 표시용 라벨
+        # 영상 표시용 라벨 - 크기 정책 수정
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignCenter)
+        # 크기 정책을 Expanding으로 유지하되, 최소 크기 힌트 설정
         self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.label.setMinimumSize(320, 240)  # 최소 크기 설정
+        self.label.setScaledContents(False)  # 스케일된 콘텐츠 비활성화
+        # 기본 배경 설정
+        self.label.setStyleSheet("QLabel { background-color: black; }")
         self.videoLayout.addWidget(self.label)
 
         # 컨트롤 바 구분선
@@ -228,14 +235,36 @@ class VideoWindow(QWidget):
         else:
             rgbImage = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+        self.DisplayFrame(rgbImage)
+
+    def DisplayFrame(self, rgbImage):
+        """프레임을 화면에 표시하는 메서드 - 중복 코드 제거 및 크기 조정 개선"""
         h, w, ch = rgbImage.shape
         bytesPerLine = ch * w
         qtImage = QImage(rgbImage.data, w, h, bytesPerLine, QImage.Format_RGB888)
-
+        
         self.currentQImage = qtImage
-
-        scaledPixmap = QPixmap.fromImage(self.currentQImage).scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        
+        # 라벨의 현재 크기에 맞춰 적절히 스케일링
+        labelSize = self.label.size()
+        scaledPixmap = QPixmap.fromImage(self.currentQImage).scaled(
+            labelSize, 
+            Qt.KeepAspectRatio, 
+            Qt.SmoothTransformation
+        )
         self.label.setPixmap(scaledPixmap)
+
+    def resizeEvent(self, event):
+        """창 크기 변경 시 비디오 프레임 다시 스케일링"""
+        super().resizeEvent(event)
+        if self.currentQImage is not None:
+            labelSize = self.label.size()
+            scaledPixmap = QPixmap.fromImage(self.currentQImage).scaled(
+                labelSize, 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            )
+            self.label.setPixmap(scaledPixmap)
 
     def UpdateTimeDisplay(self):
         currentTime = self.currentFrame / self.fps
@@ -329,13 +358,7 @@ class VideoWindow(QWidget):
                 else:
                     rgbImage = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                h, w, ch = rgbImage.shape
-                bytesPerLine = ch * w
-                qtImage = QImage(rgbImage.data, w, h, bytesPerLine, QImage.Format_RGB888)
-                self.currentQImage = qtImage
-                scaledPixmap = QPixmap.fromImage(self.currentQImage).scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.label.setPixmap(scaledPixmap)
-
+                self.DisplayFrame(rgbImage)
                 self.capture.set(cv2.CAP_PROP_POS_FRAMES, frameNumber)
 
         self.UpdateTimeDisplay()
